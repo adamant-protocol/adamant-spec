@@ -15,6 +15,26 @@ The section builds on section 3 (cryptographic primitives), section 4 (account m
 
 The design follows from Principle II (privacy by default), and it is designed to interact cleanly with Principle I (credible neutrality) and Principle IV (performance). Where these come into tension, the priority order in section 2.8 governs.
 
+## 7.0 Encryption posture
+
+All shielded encryption in this section uses **probabilistic** schemes. Two encryptions of the same plaintext under the same key produce different ciphertexts; ciphertext equality does not imply plaintext equality. This is a protocol-level commitment, not a per-site convention.
+
+The commitment matters because the runtime's shielded-value-equality semantics (§6.2.1.9) compares ciphertext bytes verbatim — `Bytecode::Eq` on two shielded values returns `true` when the ciphertext bytes match, `false` otherwise. The privacy property — *ciphertext equality reveals nothing about plaintext equality* — depends on the encryption being probabilistic. A deterministic shielded-encryption scheme would silently break this property: two equal plaintexts would produce equal ciphertexts, and an observer could detect plaintext equality by ciphertext comparison without holding the key.
+
+The §7.0 posture binds every on-chain shielded-encryption surface in this section. The surfaces and their per-site specification status as of this amendment:
+
+- **Note commitments** (§7.1) — Poseidon hash with per-note `randomness: [u8; 32]`. Scheme fully specified by §7.1; probabilistic by construction (the per-note randomness ensures uncorrelated commitments for byte-equal `(value, asset_type, recipient, metadata)` tuples).
+- **Stealth-address ciphertexts** (§7.2.2) — ML-KEM-768 encapsulation per FIPS 203. Scheme fully specified by §7.2.2; probabilistic by FIPS 203 §6.3 (a fresh `m ← {0,1}^256` is sampled per encapsulation call).
+- **Encrypted memos** (§7.6.1) — ChaCha20-Poly1305 with `memo_key = HashToKey(s || domain_tag_memo)`. Scheme partially specified by §7.6.1; the nonce-derivation half is not pinned at this amendment and remains open per the §3.5 framing ("Implementation details for nonce derivation are specified per-use in subsequent sections"). The §7.0 posture binds the eventual specification to a probabilistic shape.
+- **Encrypted note delivery** (§7.3.1 `encrypted_outputs: Vec<EncryptedNote>`) — encryption scheme not specified at this amendment. The §7.0 posture binds the eventual specification to a probabilistic shape.
+- **Shielded object contents** (§7.8.1) — encryption scheme not specified at this amendment. The §7.0 posture binds the eventual specification to a probabilistic shape.
+
+Per-site specifications for the three open surfaces (memo nonce derivation, encrypted-note delivery, shielded object contents) are subsequent §7 substantive work. The §7.0 posture pre-binds them: any scheme that lands at those subsections must be probabilistic. An implementation that proceeds with an as-yet-unspecified surface — for example, by choosing a default scheme for shielded object contents — must choose a probabilistic scheme to be conformant.
+
+**Surfaces the posture does not bind.** Out-of-protocol encryption — for example, witness encryption between a user and a prover in the prover market (§7.7.1) — is operationally distinct from on-chain shielded encryption. The §6.2.1.9 shielded-value-equality runtime semantics applies only to on-chain ciphertext bytes; out-of-protocol encryption is the user's choice and does not affect consensus.
+
+**Anti-pattern (explicitly forbidden).** Deterministic encryption schemes — for example, AES-ECB, AES-SIV with deterministic IV, or Poseidon-as-encryption without per-input randomness — are not admitted for any on-chain shielded-encryption surface. An implementation that substitutes a deterministic scheme is non-conforming, regardless of whether the scheme is otherwise cryptographically strong: the conformance break is at the privacy-property level, not the cryptographic-strength level.
+
 ## 7.1 The note model
 
 The fundamental unit of shielded value on Adamant is the **note**: a cryptographic commitment to a value held by a specified recipient under specified conditions. Notes are conceptually similar to Zcash Sapling/Orchard notes and to Aztec's notes, with adaptations for Adamant's object model.
@@ -106,19 +126,19 @@ The protocol uses an **ML-KEM-based stealth address scheme**, providing post-qua
 
 A recipient's long-term identity comprises:
 
-- **Spending key** `sk_s`: scalar in the BLS12-381 scalar field (used for nullifier derivation and spending authorization, classical layer; see section 7.2.5 for hybrid-mode considerations)
+- **Spending key** `sk_s`: scalar in the **Pallas scalar field** (used for nullifier derivation and spending-address authorization; see section 7.2.5 for hybrid-mode signature considerations, which are independent of the stealth-address arithmetic)
 - **Viewing keypair** `(sk_v_kem, pk_v_kem)`: an ML-KEM-768 keypair (public key 1184 bytes, secret key 2400 bytes)
-- **Spending public key** `pk_s = sk_s · G` where G is the BLS12-381 curve generator
+- **Spending public key** `pk_s = sk_s · G` where G is the **Pallas curve generator**
 
-The recipient's "address" published off-chain (in payment URIs, QR codes, etc.) is `(pk_s, pk_v_kem)`. ML-KEM public keys are larger than ECDH public keys, so addresses are larger; address-encoding formats accommodate this (Bech32m at appropriate length, QR codes scaled correspondingly).
+The recipient's "address" published off-chain (in payment URIs, QR codes, etc.) is `(pk_s, pk_v_kem)`. `pk_s` is a Pallas point encoded as its 32-byte canonical compressed form (x-coordinate plus sign bit). ML-KEM public keys are larger than ECDH public keys, so the combined address is dominated by `pk_v_kem` (1184 bytes); address-encoding formats accommodate this (Bech32m at appropriate length, QR codes scaled correspondingly).
 
 To send a note to this recipient, a sender:
 
 1. Performs ML-KEM-768 encapsulation against `pk_v_kem`, producing `(ct, ss)` where `ct` is a 1088-byte ciphertext and `ss` is a 32-byte shared secret
 2. Stores `ct` as part of the note's on-chain data (analogous to the `R` element in classical schemes)
-3. Computes the shared scalar: `s = HashToScalar(ss || domain_tag)` where `HashToScalar` produces a BLS12-381 scalar field element
-4. Computes the one-time stealth address: `P = pk_s + s · G`
-5. Constructs the note with `recipient = P`
+3. Computes the shared scalar: `s = HashToScalar(ss || domain_tag)` where `HashToScalar` produces a **Pallas scalar field element**
+4. Computes the one-time stealth address: `P = pk_s + s · G` (a Pallas point)
+5. Constructs the note with `recipient = P`, where `recipient` is the canonical 32-byte encoding of `P`'s base-field x-coordinate (the same Pallas-base-field element width as the rest of the note-commitment inputs per section 7.1)
 
 The recipient's wallet, upon scanning the chain, performs for each note:
 
@@ -129,7 +149,9 @@ The recipient's wallet, upon scanning the chain, performs for each note:
 
 If the note is theirs, the recipient derives the corresponding spending key as `sk' = sk_s + s'` and uses it to construct the nullifier when spending.
 
-**Why ML-KEM and not BLS12-381 ECDH.** ECDH on BLS12-381 (or any elliptic curve over a finite field) is broken by Shor's algorithm; a future quantum adversary observing historical chain state can recover `r · pk_v` from `(r · G, pk_v)` by computing the discrete logarithm. ML-KEM is lattice-based and presumed post-quantum-secure; encapsulation outputs cannot be retroactively broken by quantum attack. The cost of this protection is the per-note ciphertext size (1088 bytes vs ~32 bytes for ECDH); this is amortised across the note's lifetime and is acceptable given the permanence of the privacy guarantee.
+**Why ML-KEM and not curve ECDH.** ECDH on any elliptic curve over a finite field is broken by Shor's algorithm; a future quantum adversary observing historical chain state can recover `r · pk_v` from `(r · G, pk_v)` by computing the discrete logarithm. ML-KEM is lattice-based and presumed post-quantum-secure; encapsulation outputs cannot be retroactively broken by quantum attack. The cost of this protection is the per-note ciphertext size (1088 bytes vs ~32 bytes for ECDH); this is amortised across the note's lifetime and is acceptable given the permanence of the privacy guarantee.
+
+**Cross-curve note.** The stealth-address arithmetic above operates on the **Pasta cycle** (Pallas/Vesta), matching Halo 2's native field per section 3.9.1 and Poseidon's field of definition per section 3.3.3. This is intentional: stealth addresses appear as the `recipient` field inside note commitments (section 7.1), which are hashed in-circuit by Poseidon; placing the address arithmetic on Pallas keeps the in-circuit verification native and avoids non-native arithmetic emulation. The protocol's *other* curve, BLS12-381, is used independently for KZG vector commitments (section 3.9.2), threshold encryption (section 3.6), and validator BLS signatures (section 3.4.3); BLS12-381 does not appear in stealth-address derivation. Pre-amendment drafts of section 7.2.2 specified BLS12-381 for the stealth-address arithmetic; that conflicted with section 3.3.3's amended Poseidon field-of-definition (Pallas) and section 7.1's commitment formula. The amendment unifies the privacy-layer arithmetic on Pasta cycle native fields, parallel to the section 3.3.3 amendment instance 31.
 
 **Bytecode-level construction.** Section 6.2.1.4's `MlKemEncapsulate` and `MlKemDecapsulate` instructions perform the ML-KEM operations inside Adamant Move shielded circuits. The compiler emits these instructions automatically when `#[shielded]` functions construct or process notes; contract authors do not invoke them directly.
 
@@ -164,16 +186,70 @@ A shielded transaction comprises:
 
 ```
 ShieldedTransaction {
-    nullifiers:        Vec<Nullifier>,        // notes being spent
-    output_commitments: Vec<NoteCommitment>,  // notes being created
-    encrypted_outputs:  Vec<EncryptedNote>,   // for recipient delivery
-    public_inputs:     PublicInputs,          // explicit transaction parameters
-    proof:             Halo2Proof,            // attests to validity
-    binding_signature: Signature,             // ties the proof to the transaction
+    nullifiers:               Vec<Nullifier>,         // notes being spent
+    input_value_commitments:  Vec<ValueCommitment>,   // hiding commitments for input values (one per nullifier, same order)
+    output_commitments:       Vec<NoteCommitment>,    // notes being created
+    output_value_commitments: Vec<ValueCommitment>,   // hiding commitments for output values (one per output_commitment, same order)
+    encrypted_outputs:        Vec<EncryptedNote>,     // for recipient delivery
+    public_inputs:            PublicInputs,           // explicit transaction parameters
+    proof:                    Halo2Proof,             // attests to validity
+    binding_signature:        Signature,              // ties the proof to the transaction
 }
 ```
 
-Public inputs include the nullifiers, the output commitments, the GNCT root being spent against, the asset types involved (which may be partially disclosed for compliance), and any explicit fees. Everything else is hidden.
+Public inputs include the nullifiers, the output commitments, the input and output value commitments, the GNCT root being spent against, the asset types involved (which may be partially disclosed for compliance), and any explicit fees. Everything else is hidden.
+
+The `input_value_commitments` array is parallel to `nullifiers` (index `i` of one corresponds to index `i` of the other); the `output_value_commitments` array is parallel to `output_commitments`. The two sequences let validators perform the homomorphic balance check at consensus time without learning the underlying values; see §7.3.1.2 for the construction and §7.3.2 statement 4 for the balance constraint.
+
+#### 7.3.1.1 EncryptedNote construction
+
+An `EncryptedNote` is the on-chain ciphertext that allows the recipient to decrypt the note's contents upon scanning the chain. The construction:
+
+```
+EncryptedNote {
+    ml_kem_ciphertext: [u8; 1088],  // ML-KEM encapsulation
+    chacha_ciphertext: Vec<u8>,     // encrypted note payload
+    auth_tag:          [u8; 16],    // Poly1305 authentication tag
+}
+```
+
+A sender constructs an `EncryptedNote` as:
+
+1. ML-KEM-768 encapsulation against recipient's `pk_v_kem` per §7.2.2: `(ml_kem_ciphertext, ss) = ML-KEM-768.Encap(pk_v_kem)`
+2. Derive symmetric key: `note_key = HKDF-SHA3(salt = domain_tag_note_key, ikm = ss, info = note_position_bytes, L = 32)` where `domain_tag_note_key = b"ADAMANT-v1-note-key"` and `note_position_bytes` is the 8-byte little-endian note position in the global note commitment tree
+3. Derive nonce: `note_nonce = SHA3_256(ss || domain_tag_note_nonce)[0..12]` where `domain_tag_note_nonce = b"ADAMANT-v1-note-nonce"`
+4. Encrypt note payload (BCS-encoded note tuple per §7.1): `(chacha_ciphertext, auth_tag) = ChaCha20Poly1305-Encrypt(note_key, note_nonce, note_payload)`
+
+The recipient decrypts by ML-KEM decapsulation against `sk_v_kem`, derives the same `note_key` + `note_nonce` from the recovered shared secret, and applies `ChaCha20Poly1305-Decrypt`.
+
+**Probabilistic property satisfied per §7.0.** Per-note ML-KEM encapsulation produces a fresh `ss` per FIPS 203 §6.3 (randomized encapsulation); the derived `note_key` + `note_nonce` are per-note unique; ciphertexts are uncorrelated across notes even for byte-equal note payloads.
+
+#### 7.3.1.2 Value commitments
+
+A `ValueCommitment` is a 32-byte Pedersen-style commitment on the Pallas curve that hides a note's value while remaining additively homomorphic, so the chain can verify per-asset-type value conservation (§7.3.2 statement 4) without learning any individual value.
+
+**Construction.** For a note with value `v: u64`, asset type `τ: TypeId`, and per-commitment randomness `r ∈ Pallas scalar field`:
+
+```
+vc = v · V_τ + r · R   (a Pallas point)
+```
+
+where:
+
+- `V_τ` is the asset-specific value generator: `V_τ = HashToCurve("ADAMANT-v1-vc-base", τ_bytes)` — a Pallas point derived deterministically from the 32-byte canonical encoding of the asset type via the `pasta_curves` `Point::hash_to_curve` construction (Simplified SWU map per IRTF `draft-irtf-cfrg-hash-to-curve`).
+- `R` is the universal randomness generator: a single fixed Pallas point derived once via `R = HashToCurve("ADAMANT-v1-vc-randomness", b"")`. `R` is independent of every `V_τ` (different domain tag); the discrete log of `R` with respect to any `V_τ` is unknown to all parties (genuinely random Pallas point).
+- The on-chain encoding of `vc` is the 32-byte canonical compressed Pallas point form (x-coordinate plus 1-bit y-sign per pasta_curves' `GroupEncoding`), matching the `recipient` stealth-address encoding in §7.2.2.
+
+**Properties.**
+
+- **Hiding.** The `r · R` term blinds the value; without knowing `r`, an observer cannot recover `v` (computational hiding under the discrete-log assumption on Pallas).
+- **Asset-type hiding.** The randomness blinding extends to the asset-specific component: an observer cannot determine `τ` from `vc` alone (cannot distinguish `(v_1, τ_1, r_1)` from `(v_2, τ_2, r_2)` without solving multi-discrete-log).
+- **Binding.** Given `vc`, the opening `(v, τ, r)` is computationally unique under the discrete-log assumption (a different opening would reveal a discrete-log relation between `V_τ` and `R`).
+- **Additively homomorphic.** `vc(v_1, τ, r_1) + vc(v_2, τ, r_2) = vc(v_1 + v_2, τ, r_1 + r_2)` (point addition on Pallas, per-asset-type group). Cross-asset addition does NOT preserve commitment shape (the `V_{τ_1}` and `V_{τ_2}` generators are independent), which is exactly what makes the per-asset-type balance check work.
+
+**Per-input vs per-output randomness.** Each input note's `vc_in` carries a randomness `r_in_i` known to the spender; each output note's `vc_out` carries a randomness `r_out_j` known to the sender. The §7.3.2 statement 4 balance equation requires the randomness sums to cancel: `Σ r_in - Σ r_out = r_balance`, where `r_balance` is committed to by the [`binding_signature`] (§7.3.1) — the binding signature is over a transcript that includes `Σ vc_in - Σ vc_out` and is signed under the key `r_balance · R`. This is the standard Sapling-style binding-signature pattern (Hopwood / Bowe / Hornby / Wilcox 2020); a successful binding signature attests both that the spender chose a randomness assignment such that the per-asset-type values balance AND that the full transaction (proof + commitments) is bound to a single coherent randomness sum.
+
+**Construction of `R` and `V_τ`.** Genesis-fixed; the byte tags `b"ADAMANT-v1-vc-base"` and `b"ADAMANT-v1-vc-randomness"` are part of the consensus rules per §3.3.1 (changing them is a hard fork). Wallet implementations MUST derive `R` lazily once at startup and cache it; `V_τ` is derived per asset type the wallet handles.
 
 ### 7.3.2 The validity circuit
 
@@ -186,6 +262,14 @@ The Halo 2 circuit that proves validity asserts the following statements:
 3. **Output note well-formedness.** Each output commitment is correctly computed from valid inputs (a recipient stealth address, a value, an asset type, randomness).
 
 4. **Value conservation.** The sum of input values equals the sum of output values plus the explicit fees, *per asset type*. This is the property that prevents inflation: a shielded transaction cannot create value from nothing or destroy value silently.
+
+   Enforced via the homomorphic value commitments of §7.3.1.2. The validity circuit attests that each per-input and per-output value commitment is correctly constructed (the prover knows `(v, τ, r)` openings consistent with the corresponding note commitment). The chain-level balance check is then a single point equation evaluated on public data:
+
+   ```
+   Σ vc_in − Σ vc_out − Σ_τ (fee_τ · V_τ) = r_balance · R
+   ```
+
+   Validators verify this equation and the binding signature over the same transcript (§7.3.1.2). Both checks are public-data-only — no zero-knowledge proof is needed for the balance equation itself; the proof is needed only for the per-commitment opening attestation. The balance check is per-asset-type implicitly: because `V_τ` is independent across asset types (§7.3.1.2 hash-to-curve construction), the balance equation can hold only if for every τ in the transaction, `Σ_in v_τ = Σ_out v_τ + fee_τ` (otherwise the `V_τ` term would not cancel).
 
 5. **Range proofs.** Every value in the transaction lies in `[0, 2^64)`. Without this, an attacker could create notes with negative values that nominally satisfy value conservation while creating value.
 
@@ -231,17 +315,36 @@ The viewing key has full visibility. Sub-view-keys are derived deterministically
 
 ### 7.4.2 Sub-view-key construction
 
-A sub-view-key for scope `S` is constructed as:
+A sub-view-key for scope `S` is a deterministically derived ML-KEM-768 keypair:
 
 ```
-sub_view_key_S = (sk_v + Hash(domain || S || sk_v) · G_aux)
+sub_seed_S = HKDF-SHA3(
+    salt = domain_tag_subview,
+    ikm  = sk_v_kem_seed,
+    info = BCS(S),
+    L    = 64
+)
+(sub_sk_v_kem_S, sub_pk_v_kem_S) = ML-KEM-768.KeyGen(sub_seed_S)
 ```
 
-Where `G_aux` is a fixed auxiliary curve point and `S` is a structured description of the sub-key's scope (e.g. `{"start": t1, "end": t2}` for a time-windowed key).
+where:
 
-The sub-view-key allows the holder to compute the shared secret `s'` for notes that fall within scope `S`, but is cryptographically constructed so that notes outside scope `S` produce nonsense decryption results.
+- `sk_v_kem_seed` is the 64-byte canonical seed of the parent viewing keypair `(sk_v_kem, pk_v_kem)` per §7.2.2
+- `domain_tag_subview = b"ADAMANT-v1-subview-derive"`
+- `S` is the structured scope descriptor (e.g. `{"start": t1, "end": t2}` for a time-windowed key); `BCS(S)` is its canonical encoding per §5.1.8
+- HKDF-SHA3 is the HKDF construction per RFC 5869 instantiated with SHA3-256, matching the HKDF usage for spending-key derivation per §7.2.5
+- L = 64 produces the 64-byte seed required for ML-KEM-768 deterministic key generation per FIPS 203 §6.1
+- ML-KEM-768.KeyGen is the FIPS 203 deterministic key-generation function
 
-The implementation of "in scope" is enforced by the recipient's wallet, not by the chain: the wallet decides which sub-view-keys to derive and to whom. The chain has no view-key-related logic; it does not know which sub-view-keys exist.
+Properties:
+
+- **One-way derivation.** A sub-view-key holder cannot derive the parent viewing-keypair seed. HKDF-SHA3 is cryptographically one-way; reversing the derivation requires breaking SHA3-256 preimage resistance.
+- **Scope-bound decapsulation.** The sub-view-key holder can decapsulate notes whose stealth-address derivation used the same ML-KEM public key family (i.e., notes within scope `S`). Notes outside scope `S` were encapsulated against the parent `pk_v_kem`, not `sub_pk_v_kem_S`; decapsulating them with the sub-view-key produces deterministic-but-meaningless results per FIPS 203 §6.4.1 implicit rejection.
+- **Determinism.** Same parent seed + same scope `S` always produces the same sub-view-key. No per-derivation entropy.
+
+The implementation of "in scope" — which sub-view-keys to derive and to whom — is enforced by the recipient's wallet, not by the chain. The chain has no sub-view-key awareness.
+
+**Bytecode-level construction.** Section 6.2.1.4's `ReleaseSubViewKey` instruction performs the HKDF-SHA3 derivation step; ML-KEM-768.KeyGen from the derived seed is performed by the wallet outside shielded execution (the runtime does not need to materialise the keypair; only the seed is exposed via `ReleaseSubViewKey`).
 
 ### 7.4.3 Provable disclosure
 
@@ -313,6 +416,16 @@ memo_key = HashToKey(s || domain_tag_memo)
 encrypted_memo = ChaCha20Poly1305(memo_key, nonce, memo_plaintext)
 ```
 
+The nonce is derived deterministically from the per-note shared secret to ensure non-reuse:
+
+```
+nonce = SHA3_256(s || domain_tag_memo_nonce)[0..12]
+```
+
+where `s` is the per-note ML-KEM shared secret per §7.2.2 and `domain_tag_memo_nonce = b"ADAMANT-v1-memo-nonce"`. The 12-byte truncation matches ChaCha20-Poly1305's 96-bit nonce width per §3.5.
+
+Nonce non-reuse follows from `s` being per-note (each note has fresh ML-KEM encapsulation per §7.2.2) and the domain tag preventing cross-protocol nonce collision. The construction satisfies the §7.0 encryption-posture probabilistic-only requirement: equal memo plaintexts under different notes encrypt under different `(memo_key, nonce)` pairs and produce uncorrelated ciphertexts.
+
 The recipient decrypts using their derived shared secret.
 
 ### 7.6.2 Memo policies
@@ -355,7 +468,22 @@ Section 5.7 anticipated this subsection: how does the privacy layer interact wit
 
 An object is either **shielded** or **transparent**, declared at creation:
 
-- **Shielded objects.** The `contents` field is encrypted. State transitions are accompanied by Halo 2 proofs attesting to correctness. The object's existence is public; its contents and ownership details are not.
+- **Shielded objects.** The `contents` field is encrypted using the following construction:
+
+```
+shielded_contents {
+    object_key_ciphertext: [u8; 1088],  // ML-KEM encapsulation
+    contents_ciphertext:   Vec<u8>,     // encrypted contents
+    auth_tag:              [u8; 16],    // Poly1305 tag
+    update_nonce:          [u8; 12],    // per-update nonce
+}
+```
+
+The `object_key_ciphertext` is an ML-KEM-768 encapsulation against the owner's viewing public key `pk_v_kem` per §7.2.2, performed at object creation or owner-rotation. The encapsulated shared secret `ss_obj` is the long-term object-level key material. Per-update encryption derives the symmetric key as `update_key = HKDF-SHA3(salt = domain_tag_object_update, ikm = ss_obj, info = object_id || version_u64_le, L = 32)` where `domain_tag_object_update = b"ADAMANT-v1-object-update"`. The `update_nonce` is sampled fresh per write (random 12-byte value); encryption is `(contents_ciphertext, auth_tag) = ChaCha20Poly1305-Encrypt(update_key, update_nonce, contents_payload)`.
+
+State transitions update `contents_ciphertext` + `update_nonce` together; `object_key_ciphertext` rotates only on owner change. State transitions are accompanied by Halo 2 proofs attesting to correctness. The object's existence is public; its contents and ownership details are not.
+
+The construction satisfies the §7.0 encryption-posture probabilistic-only requirement: per-update random nonce ensures equal `contents_payload` across updates produces uncorrelated ciphertexts.
 
 - **Transparent objects.** The `contents` field is in clear text. State transitions are visible to all observers. Ownership is visible. Useful for public-record applications, public bounties, transparent governance, and any case where the application's purpose requires transparency.
 

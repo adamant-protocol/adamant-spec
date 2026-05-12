@@ -138,15 +138,20 @@ ML-DSA (Module-Lattice-Based Digital Signature Algorithm) is the protocol's post
 
 **Rationale.** ML-DSA is one of three post-quantum signature schemes selected by NIST through a multi-year open competition (2017–2022). It provides security under standard lattice problem assumptions (Module Learning With Errors, Module Short Integer Solution) and has been the subject of extensive cryptanalysis without significant security degradation. Recent benchmarks (October 2025, arXiv 2510.09271) demonstrate that ML-DSA verification at security level 5 is approximately 0.14 milliseconds on ARM-based laptops — faster than ECDSA at 0.88 milliseconds. ML-DSA is therefore not a performance compromise; at the security levels relevant to long-term consensus, it is a performance improvement.
 
-**Parameters.** The protocol uses **ML-DSA-65** (security level 3, equivalent to AES-192 or SHA-384 collision resistance), providing 192-bit classical security and approximately 128-bit security against quantum attack. Public keys are 1952 bytes; signatures are 3309 bytes. This is significantly larger than Ed25519 but acceptable for the protocol's per-transaction and per-vote cost budget.
+**Parameters.** The protocol supports two ML-DSA parameter sets:
 
-The signature size reflects FIPS 204 (final, August 2024). The CRYSTALS-Dilithium round 3 NIST PQC submission specified 3293-byte signatures for the equivalent parameter set; the standardisation process expanded the encoding by 16 bytes for the final standard. References to the round-3 size (3293 bytes) in pre-2024 literature are obsolete; the protocol uses the FIPS 204 final size throughout.
+- **ML-DSA-65** (security level 3, equivalent to AES-192 or SHA-384 collision resistance) — the **default**. Provides 192-bit classical security and approximately 128-bit security against quantum attack. Public keys are 1952 bytes; signatures are 3309 bytes.
+- **ML-DSA-87** (security level 5, equivalent to AES-256 collision resistance) — opt-in for accounts prioritising the highest standardised post-quantum security level. Provides 256-bit classical security. Public keys are 2592 bytes; signatures are 4627 bytes per FIPS 204 final.
 
-**Why level 3 and not level 2 or level 5.** Level 2 (ML-DSA-44) provides 128-bit classical security, marginal in long-lived systems. Level 5 (ML-DSA-87) provides 256-bit classical security at significantly higher signature size (4627 bytes per FIPS 204 final) and computational cost. Level 3 is the appropriate balance for a chain whose lifetime is intended to be measured in decades.
+Both variants are first-class at the protocol level: §6's `Signature` enum carries explicit variant tags for each (`MlDsa65 = 0x01`, `MlDsa87 = 0x02`), and the AVM ships verification instructions for both (`MlDsaVerify65`, `MlDsaVerify87`). Both signature widths are significantly larger than Ed25519 but acceptable for the protocol's per-transaction and per-vote cost budget.
 
-**Account flexibility.** Section 4 specifies an account model in which an individual account may declare itself to use Ed25519 only, ML-DSA only, or both (with both required for transactions, providing belt-and-braces security). Validators `MUST` support all three account types from genesis.
+The signature sizes reflect FIPS 204 (final, August 2024). The CRYSTALS-Dilithium round 3 NIST PQC submission specified different sizes for the equivalent parameter sets; the standardisation process adjusted the encoding for the final standard. References to round-3 sizes in pre-2024 literature are obsolete; the protocol uses FIPS 204 final sizes throughout.
 
-**Library.** The reference implementation uses the `ml_dsa` crate from the RustCrypto project, which is the FIPS-204-compliant ML-DSA implementation. As ML-DSA implementations mature, the protocol may revise its choice of library; the algorithm choice (ML-DSA-65) is fixed.
+**Default selection rationale.** Level 2 (ML-DSA-44) is excluded — 128-bit classical security is marginal in long-lived systems. Level 3 (ML-DSA-65) is the default because it offers a security/cost balance appropriate to a chain whose lifetime is intended to be measured in decades. Level 5 (ML-DSA-87) is opt-in: an account that prioritises 256-bit classical security at the cost of larger signatures (~40 % overhead) and modestly higher verification cost may declare itself to use ML-DSA-87 instead.
+
+**Account flexibility.** Section 4 specifies an account model in which an individual account may declare itself to use Ed25519 only, ML-DSA only (with the variant — `MlDsa65` or `MlDsa87` — selected at account creation), or both (with both required for transactions, providing belt-and-braces security). Validators `MUST` support all account variants from genesis.
+
+**Library.** The reference implementation uses the `ml_dsa` crate from the RustCrypto project, which is the FIPS-204-compliant ML-DSA implementation supporting both parameter sets. As ML-DSA implementations mature, the protocol may revise its choice of library; the algorithm choice (ML-DSA at security levels 3 and 5) is fixed.
 
 ### 3.4.3 Aggregate signatures: BLS on BLS12-381
 
@@ -341,6 +346,32 @@ Wesolowski's VDF security depends on the unknown-order assumption in class group
 ### 3.8.5 Transition to threshold encryption
 
 When the active set crosses the viability boundary N≥15 (subsection 8.4.2), the chain transitions from time-lock encryption to threshold encryption automatically. The transition is one-way per epoch: the chain operates one regime per epoch, never both simultaneously, with hysteresis (switch to threshold at N≥15; switch back at N<10) preventing flapping at the boundary. Pending time-lock-encrypted transactions submitted before the transition complete decryption normally; new transactions submitted after the transition use the threshold key.
+
+### 3.8.6 Deterministic class-group setup
+
+The class group's parameters — the negative discriminant `D` and the procedure for sampling random class-group elements — are derived deterministically from the genesis state per subsection 11.2.8 ("derived deterministically from the genesis state... using a hash-to-class-group construction"). This subsection specifies the construction.
+
+**Setup-source seed.** The setup consumes a single 32-byte seed extracted from the genesis-state commitment (subsection 11.2.8). This seed is genesis-fixed and immutable; every node derives the same parameters from the same seed.
+
+**Discriminant derivation.** Given seed `s ∈ {0, 1}^256` and target bit-length `k` (where `k ≥ 2048` per subsection 3.8.2 for ≥128-bit classical security), the discriminant `D` is derived as:
+
+```
+1.  raw ← tagged_shake_256(CLASS_GROUP_DISCRIMINANT, BCS(s, k), k/8 bytes)
+2.  d   ← the non-negative integer represented by `raw` in big-endian
+3.  Set the high bit of `d` (bit position k − 1):
+    d ← d | (1 << (k − 1))
+4.  Clear the low two bits of `d`, then set both:
+    d ← (d & ¬3) | 3     # ensures d ≡ 3 (mod 4), hence D = −d ≡ 1 (mod 4)
+5.  D ← −d                # discriminant of imaginary quadratic order
+```
+
+Step 3 fixes the bit-width: the resulting `|D|` always has exactly `k` bits. Step 4 ensures `d ≡ 3 (mod 4)` so that `D = −d ≡ 1 (mod 4)`, which is required for `D` to be a valid discriminant of an integral binary quadratic form (subsection 3.8.1; the alternative `D ≡ 0 (mod 4)` is excluded here so the construction is single-residue-class and the algorithm above is deterministic-and-total). Step 5 produces the negative discriminant the class group is defined over.
+
+**Domain tag.** The construction uses a new BIP-340 tagged-hash domain tag `CLASS_GROUP_DISCRIMINANT = b"ADAMANT-v1-class-group-discriminant"` (subsection 3.3.1). This tag is consensus-binding: changing it after genesis would shift the entire class group to a different one, breaking every existing time-lock envelope. Per subsection 3.3.1, adding or renaming a domain tag is a hard fork.
+
+**Fundamental-discriminant calibration.** A discriminant `D` is **fundamental** when the imaginary quadratic order it defines is the maximal order of `ℚ(√D)`. Fundamental discriminants are the canonical inputs to the unknown-order assumption underlying the Wesolowski VDF; non-fundamental discriminants give class groups that are still useful but offer no security advantage and have a marginally different structure. The construction above does NOT enforce fundamentality: doing so would require primality / square-freeness tests over `k`-bit candidates that are themselves a substantial computational sub-arc. Empirical analysis on the deterministic seed prior to genesis confirms `D` is fundamental for the genesis-fixed seed before activation; if the analysis surfaces a non-fundamental result, the seed is rejected and the genesis state is rotated (genesis state itself is constitutional per subsection 11.2.8, so the rotation happens before publication, never after). This calibration is a pre-mainnet workstream item recorded in CLAUDE.md Section 10.
+
+**Hash-to-element procedure (pending sub-arc).** Sampling a uniformly-random class-group element from a byte string is required for time-lock envelope encryption (subsection 3.8.1 "Encryption"): the user's puzzle `g` is itself a hash-to-element output. The procedure follows the standard approach: deterministically iterate over candidate leading coefficients `a` (small primes), find `b` such that `b² ≡ D (mod 4a)` via Tonelli-Shanks modular square root, compute `c = (b² − D) / (4a)`, and return the reduced form. The full algorithm is specified at the implementation sub-arc when the modular-square-root infrastructure lands.
 
 ## 3.9 Zero-knowledge proofs
 

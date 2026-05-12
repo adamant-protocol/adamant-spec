@@ -564,6 +564,48 @@ A module is valid for deployment if and only if all five steps succeed. The orde
 
 **Implementation note.** The Adamant-native deserializer, serializer, type definitions, helpers, and verifier passes are protocol-level concerns: a conforming implementation must reach the same accept/reject decision on every module-bytes input as the spec's pipeline, and the production-build dependency posture is fixed (no vendored Sui-Move crates in the production dependency graph; test-only, build-tooling-only, and CI-only dependencies are explicitly permitted). Internal representations, data-structure choices, and pass-orchestration details are implementation-discretionary, but both the externally observable accept/reject behaviour and the production-dependency posture are fixed. Two implementations that disagree on whether a given module-bytes input is valid for deployment are not both conforming, regardless of internal choices. The vendored Sui-Move crates are a cross-validation reference for the inherited subset and are exercised at test time; they are not part of the protocol-level specification and cannot appear in conforming production builds.
 
+#### 6.2.1.9 Arithmetic semantics
+
+The bytecode instructions enumerated in §6.2.1.4 include arithmetic, comparison, shift, and cast operations whose runtime semantics are part of the consensus-binding inherited-Sui-Move subset. The verifier (§6.2.1.6) statically rules out type mismatches at deploy time; the AVM runtime executes the well-typed instructions with the semantics specified in this subsection. These semantics are genesis-fixed in the same sense as the per-instruction gas costs (§6.2.1.7) and the deserialize+verify pipeline (§6.2.1.8).
+
+**Overflow handling.** `Add`, `Sub`, and `Mul` abort when the result of the operation would fall outside the operand type's unsigned integer range. The check applies uniformly to all six integer widths (`u8`, `u16`, `u32`, `u64`, `u128`, `u256`); no implicit wrapping or saturation occurs. The abort surfaces as a runtime arithmetic error. The transaction fails with state revert per §6.2.2 step 7 ("if execution failed, all state changes are discarded"), with gas charged for consumption up to the point of failure per §6.3.3.
+
+This matches the Move ecosystem's standard checked-arithmetic posture and preserves §6.2.4's determinism requirement: abort-on-overflow is deterministic across validators.
+
+**Division and modulo by zero.** `Div` and `Mod` abort when the right-hand operand (the divisor) is zero. The abort applies uniformly to all six integer widths. The abort surfaces as a runtime arithmetic error.
+
+**Shift amount bounds.** `Shl` and `Shr` consume the right-hand operand as a `u8` shift amount per the Move ecosystem convention. For operand types `u8`, `u16`, `u32`, `u64`, and `u128`, the runtime aborts when the shift amount is greater than or equal to the operand's bit width; the abort surfaces as a runtime arithmetic error. For operand type `u256`, no abort condition applies: the shift amount is necessarily less than 256 (the operand's bit width) because the shift amount is parsed as a `u8`, so the bounds check is structurally unreachable. The shift result for `u256` is well-defined for every `u8` shift amount in `[0, 255]`, computed as the unsigned-integer shift `lhs << rhs` (or `lhs >> rhs`) modulo `2^256`.
+
+These shift semantics align with Sui-Move's runtime semantics for the inherited subset; alignment preserves the strict-superset commitment of §6.2.1.1 — a pure-Sui module that exhibits abort-on-shift-too-large on Sui exhibits the same behaviour on Adamant.
+
+**Cast semantics.** `CastU8`, `CastU16`, `CastU32`, `CastU64`, `CastU128`, and `CastU256` convert the top-of-stack value to the destination type named in the opcode. The deploy-time type-safety pass admits any integer source type for any integer destination type; the runtime distinguishes three cases by the destination type's representable range relative to the source value:
+
+- *Same-type cast* (destination type equal to source type). The conversion always succeeds; the result is the source value unchanged.
+- *Widening cast* (destination bit width strictly greater than source bit width). The conversion always succeeds; the source value is representable in the destination type by zero-extension.
+- *Narrowing cast* (destination bit width less than source bit width). The conversion succeeds when the source value lies within the destination type's representable range; otherwise the runtime aborts with a runtime arithmetic error.
+
+Silent truncation is not protocol behaviour: financial code routinely depends on cast-to-narrower being either lossless or loud, and Adamant aligns with Move ecosystem precedent in choosing loud (abort-on-out-of-range) over silent.
+
+**Comparison ordering.** `Lt`, `Gt`, `Le`, and `Ge` interpret integer operands as unsigned. Adamant Move's integer types are all unsigned: there are no signed integer primitives, in keeping with Move's inherited type system. The comparison is well-defined for any pair of operands of the same integer type — `Lt(a, b)` returns `true` if and only if the unsigned-integer interpretation of `a` is strictly less than the unsigned-integer interpretation of `b`.
+
+Adding signed integer types is a hard fork; the unsigned interpretation of these comparison instructions is genesis-fixed.
+
+**Cross-type comparison: verifier residual binding.** The deploy-time type-safety pass (§6.2.1.6 inherited check) ensures that `Lt`, `Gt`, `Le`, `Ge`, `Eq`, and `Neq` dispatch only on operand pairs of matching types, and that `Eq` / `Neq` operate only on values whose types carry the appropriate ability. The runtime carries a residual binding for the case where the verifier failed to catch the mismatch: if a comparison reaches the runtime with operands of different types, the AVM aborts the transaction with an invariant-violation error. This case fires only if the verifier was unsound for the inherited subset or if the bytecode was modified after deployment outside the upgrade-compatibility surface (§6.4.3); same posture as the residual binding for Rule 7 privacy consistency in §6.2.1.6.
+
+**Equality semantics.** `Eq` and `Neq` pop two values from the operand stack and compare them at the runtime representation level. `Eq` returns `true` when the two values are byte-identical in their runtime representation; `Neq` returns `true` when they differ.
+
+For primitive types (`u8` through `u256`, `bool`, `address`), byte-identity is equivalent to value equality at the unsigned-integer / boolean / address-byte interpretation. For struct values, byte-identity is computed field-wise and recurses into nested structs: two struct values are equal if and only if their `type_id` matches and every corresponding field is equal under this same definition. For vectors, byte-identity is computed element-wise: two vectors are equal if and only if they have the same length and every corresponding element is equal.
+
+*Shielded values.* A shielded value (§7) is represented at the runtime layer by its ciphertext form. `Eq` and `Neq` on shielded values compare the ciphertext bytes, not the underlying plaintexts. The relationship between ciphertext equality and plaintext equality is determined by §7's encryption scheme for the specific shielded-value category: under probabilistic encryption schemes (such as the Poseidon commitment scheme with per-note randomness used for §7.1.1 notes, or the ChaCha20-Poly1305 AEAD with per-memo nonce used for §7.6.1 encrypted memos), ciphertext equality does not imply plaintext equality and `Eq` does not leak plaintext information through its result; under any deterministic encryption scheme that §7 may admit, ciphertext equality would imply plaintext equality, and `Eq` would correspondingly reveal that property to observers. Plaintext equality on shielded values is a privacy-layer primitive: contract authors who require plaintext-equality semantics on shielded operands must invoke a privacy-circuit instruction (`GenerateProof` or `VerifyProof` per §6.2.1.4) with a circuit whose witness encodes plaintext equality, expressed in the contract's circuit definition (§7) rather than in raw bytecode.
+
+The verifier (§6.2.1.6) does not statically diagnose bytecode-level `Eq` on shielded values as potential plaintext-equality misuse; this responsibility rests with the contract author and with compiler / IDE tooling at the source-language layer rather than at the protocol layer. The runtime executes `Eq` on shielded values with the ciphertext-byte-comparison semantics specified above regardless of whether the result corresponds to plaintext equality in the contract author's intended sense.
+
+This separation preserves the privacy guarantee at the cryptographic boundary specified by §7: a shielded value's plaintext is revealed only at privacy-circuit dispatch points. Bytecode-level equality testing on shielded values does not constitute that boundary; whether ciphertext equality leaks plaintext equality at the observer level is a property of §7's encryption scheme rather than of the AVM's `Eq` semantics.
+
+**Wrapping arithmetic and the bytecode enum.** The bytecode enum specified in §6.2.1.4 contains no wrapping-arithmetic opcodes — no `WrappingAdd`, `WrappingShl`, or analogues. Adding wrapping-arithmetic opcodes is a hard fork per §6.2.1.4's "the complete instruction set — inherited and extension — is genesis-fixed" framing. The current set ships the checked semantics (abort-on-overflow / abort-on-zero / abort-on-shift-too-large) specified above.
+
+**Genesis-fixed posture.** These semantics are part of the inherited Sui-Move runtime that is consensus-binding from genesis per §6.2.1.6 ("a module that is accepted is guaranteed by the consensus layer to have the validated properties"). Two implementations of Adamant that disagree on the runtime semantics of any inherited arithmetic, comparison, shift, or cast instruction are not both conforming, regardless of internal structure. Implementations may, of course, optimise the implementation of these semantics (e.g., compiler intrinsics, SIMD lanes, batch evaluation) so long as the externally observable accept/reject decision and stack-effect for any well-typed inputs match this specification.
+
 ### 6.2.2 Execution model
 
 When a transaction is executed by the AVM, the following sequence occurs:
@@ -673,7 +715,17 @@ Smart contracts on Adamant are organised into *modules*, the same unit of code o
 
 Module deployment is a transaction whose effect is to create a new `Module` object on the chain. The `Module` object's `mutability` field is the module's declared mutability (from the `#[mutability(...)]` annotation, section 6.1.2). The module's bytecode is stored in the `contents` field.
 
-After deployment, contracts and other modules can reference the deployed module by its `ObjectId`, invoke its public functions, and read its public types.
+The `Module` object's fields are constructed as follows:
+
+- **`id`** — derived per section 5.1.1 from the deploying transaction's `TxHash` and the deployment's index within the transaction (transactions may deploy multiple modules atomically; the index disambiguates).
+- **`type_id`** — the genesis-fixed `TypeId` for `adamant::module::Module`, computed per section 5.1.2 over the canonical type identifier `(adamant_address, "module", "Module")` where `adamant_address` is the protocol-reserved address `0x1` (section 5.1.2's address-keyed namespace; `0x1` is the genesis-fixed address of the `adamant::*` standard library, parallel to Sui-Move's `0x1`/`0x2` system-address convention adapted for Adamant).
+- **`owner`** — `Ownership::Address(deploying_account)` taken from the transaction's `authorising_account` field. Modules are owned by the account that deployed them; the owner's authority over the module is bounded by the module's declared mutability (section 6.1.2). Stdlib modules deployed at genesis carry `Ownership::Shared` since they are not owned by any account.
+- **`mutability`** — the module's declared mutability, BCS-decoded from the `b"adamant.mutability"` metadata entry per section 6.2.1.3 and validated by validator Rule 1 (section 6.2.1.6).
+- **`lifecycle`** — `Active`. Modules use the standard object lifecycle (section 5.1.7); `Frozen` arises only via explicit `adamant::module::freeze` for `UpgradeableUntilFrozen` modules; `Archived` and `Destroyed` are the standard object-lifecycle states.
+- **`contents`** — the canonical Adamant Move bytecode of the module, byte-identical to the bytes that were validated by the deploy-time bytecode validator (section 6.2.1.6). Re-serialization of the validated `CompiledModule` and byte-comparison against the input is part of the validator's canonicality round-trip; the same bytes flow into `contents`.
+- **`metadata`** — the standard `ObjectMetadata` per section 5.1.6, with `creator` set to the deploying account and `proof_commitment` derived per the module-deployment commitment construction (deferred to section 7 for shielded deployments; transparent deployments commit to the bytecode hash).
+
+After deployment, contracts and other modules can reference the deployed module by its `ObjectId`, invoke its public functions, and read its public types. The `(deploying_address, module_name)` pair is also globally unique per the Move module-namespacing rule (section 6.2.1.3); the validator's `duplication_checker` pass rejects deployments that would create a name collision under the same deploying address.
 
 ### 6.4.2 Upgrade
 
@@ -702,7 +754,9 @@ For cases where breaking changes are desired, the standard pattern is to deploy 
 The protocol provides a standard library of modules, deployed at genesis with `Immutable` mutability. The standard library includes:
 
 - `adamant::primitives` — basic types (vectors, options, strings, etc.) and operations
-- `adamant::object` — object manipulation primitives
+- `adamant::module` — module deployment, upgrade, and freeze primitives invoked by the transaction format per section 6.0.2 line 97 (`adamant::module::deploy`) and section 6.4.2 (upgrade and freeze)
+- `adamant::tx_context` — transaction-context accessors (sender address, transaction hash, gas budget remaining) made available to executing bytecode by the runtime per section 6.2.2
+- `adamant::object` — object manipulation primitives (transfer, freeze, share, archive, restore)
 - `adamant::address` — address arithmetic and validation
 - `adamant::hash` — SHA-3 and BLAKE3 wrappers
 - `adamant::signature` — Ed25519 and ML-DSA verification
@@ -713,6 +767,10 @@ The protocol provides a standard library of modules, deployed at genesis with `I
 - `adamant::recovery` — social-recovery helpers for accounts
 
 Modules in the standard library are accessible from any contract without separate deployment. They are `Immutable` and cannot be modified post-genesis. A future hard fork may extend the standard library; existing standard-library modules are permanent.
+
+The `adamant::module`, `adamant::tx_context`, `adamant::object`, `adamant::hash`, `adamant::signature`, `adamant::privacy`, and `adamant::address` modules expose protocol-level operations that require runtime-side execution beyond what ordinary Adamant Move bytecode can express (chain-state mutation, cryptographic primitives, view-key release, primitive-type ↔ byte-vector conversion, etc.). Function calls to these modules' functions are dispatched by the runtime to native Rust handlers per the AVM's execution model (section 6.2.2). The dispatch is byte-identical from the caller's perspective to a normal `Call` instruction; the difference is internal to the runtime and consensus-binding via the genesis-fixed mapping from `(module_id, function_id)` to native handler. Adding or removing a native-dispatched stdlib function is a hard fork.
+
+Within `adamant::address`, the `to_bytes` and `from_bytes` functions are runtime-dispatched because Move's `address` primitive type cannot be converted to `vector<u8>` in pure bytecode. The `equals` function is also runtime-dispatched for symmetry with the rest of the address helper set, even though Move's built-in `==` operator could express the same check; consolidating the address API at one dispatch tier simplifies the gas-table treatment per section 6.2.1.7.
 
 The standard library is deliberately conservative. It provides the primitives applications need without prescribing application architectures. Higher-level patterns (decentralised exchange logic, lending protocols, identity systems, etc.) are expected to be implemented as user-deployed modules, not bundled into the standard library.
 

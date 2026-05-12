@@ -510,15 +510,20 @@ ML-DSA (Module-Lattice-Based Digital Signature Algorithm) is the protocol's post
 
 **Rationale.** ML-DSA is one of three post-quantum signature schemes selected by NIST through a multi-year open competition (2017–2022). It provides security under standard lattice problem assumptions (Module Learning With Errors, Module Short Integer Solution) and has been the subject of extensive cryptanalysis without significant security degradation. Recent benchmarks (October 2025, arXiv 2510.09271) demonstrate that ML-DSA verification at security level 5 is approximately 0.14 milliseconds on ARM-based laptops — faster than ECDSA at 0.88 milliseconds. ML-DSA is therefore not a performance compromise; at the security levels relevant to long-term consensus, it is a performance improvement.
 
-**Parameters.** The protocol uses **ML-DSA-65** (security level 3, equivalent to AES-192 or SHA-384 collision resistance), providing 192-bit classical security and approximately 128-bit security against quantum attack. Public keys are 1952 bytes; signatures are 3309 bytes. This is significantly larger than Ed25519 but acceptable for the protocol's per-transaction and per-vote cost budget.
+**Parameters.** The protocol supports two ML-DSA parameter sets:
 
-The signature size reflects FIPS 204 (final, August 2024). The CRYSTALS-Dilithium round 3 NIST PQC submission specified 3293-byte signatures for the equivalent parameter set; the standardisation process expanded the encoding by 16 bytes for the final standard. References to the round-3 size (3293 bytes) in pre-2024 literature are obsolete; the protocol uses the FIPS 204 final size throughout.
+- **ML-DSA-65** (security level 3, equivalent to AES-192 or SHA-384 collision resistance) — the **default**. Provides 192-bit classical security and approximately 128-bit security against quantum attack. Public keys are 1952 bytes; signatures are 3309 bytes.
+- **ML-DSA-87** (security level 5, equivalent to AES-256 collision resistance) — opt-in for accounts prioritising the highest standardised post-quantum security level. Provides 256-bit classical security. Public keys are 2592 bytes; signatures are 4627 bytes per FIPS 204 final.
 
-**Why level 3 and not level 2 or level 5.** Level 2 (ML-DSA-44) provides 128-bit classical security, marginal in long-lived systems. Level 5 (ML-DSA-87) provides 256-bit classical security at significantly higher signature size (4627 bytes per FIPS 204 final) and computational cost. Level 3 is the appropriate balance for a chain whose lifetime is intended to be measured in decades.
+Both variants are first-class at the protocol level: §6's `Signature` enum carries explicit variant tags for each (`MlDsa65 = 0x01`, `MlDsa87 = 0x02`), and the AVM ships verification instructions for both (`MlDsaVerify65`, `MlDsaVerify87`). Both signature widths are significantly larger than Ed25519 but acceptable for the protocol's per-transaction and per-vote cost budget.
 
-**Account flexibility.** Section 4 specifies an account model in which an individual account may declare itself to use Ed25519 only, ML-DSA only, or both (with both required for transactions, providing belt-and-braces security). Validators `MUST` support all three account types from genesis.
+The signature sizes reflect FIPS 204 (final, August 2024). The CRYSTALS-Dilithium round 3 NIST PQC submission specified different sizes for the equivalent parameter sets; the standardisation process adjusted the encoding for the final standard. References to round-3 sizes in pre-2024 literature are obsolete; the protocol uses FIPS 204 final sizes throughout.
 
-**Library.** The reference implementation uses the `ml_dsa` crate from the RustCrypto project, which is the FIPS-204-compliant ML-DSA implementation. As ML-DSA implementations mature, the protocol may revise its choice of library; the algorithm choice (ML-DSA-65) is fixed.
+**Default selection rationale.** Level 2 (ML-DSA-44) is excluded — 128-bit classical security is marginal in long-lived systems. Level 3 (ML-DSA-65) is the default because it offers a security/cost balance appropriate to a chain whose lifetime is intended to be measured in decades. Level 5 (ML-DSA-87) is opt-in: an account that prioritises 256-bit classical security at the cost of larger signatures (~40 % overhead) and modestly higher verification cost may declare itself to use ML-DSA-87 instead.
+
+**Account flexibility.** Section 4 specifies an account model in which an individual account may declare itself to use Ed25519 only, ML-DSA only (with the variant — `MlDsa65` or `MlDsa87` — selected at account creation), or both (with both required for transactions, providing belt-and-braces security). Validators `MUST` support all account variants from genesis.
+
+**Library.** The reference implementation uses the `ml_dsa` crate from the RustCrypto project, which is the FIPS-204-compliant ML-DSA implementation supporting both parameter sets. As ML-DSA implementations mature, the protocol may revise its choice of library; the algorithm choice (ML-DSA at security levels 3 and 5) is fixed.
 
 ### 3.4.3 Aggregate signatures: BLS on BLS12-381
 
@@ -714,6 +719,32 @@ Wesolowski's VDF security depends on the unknown-order assumption in class group
 
 When the active set crosses the viability boundary N≥15 (subsection 8.4.2), the chain transitions from time-lock encryption to threshold encryption automatically. The transition is one-way per epoch: the chain operates one regime per epoch, never both simultaneously, with hysteresis (switch to threshold at N≥15; switch back at N<10) preventing flapping at the boundary. Pending time-lock-encrypted transactions submitted before the transition complete decryption normally; new transactions submitted after the transition use the threshold key.
 
+### 3.8.6 Deterministic class-group setup
+
+The class group's parameters — the negative discriminant `D` and the procedure for sampling random class-group elements — are derived deterministically from the genesis state per subsection 11.2.8 ("derived deterministically from the genesis state... using a hash-to-class-group construction"). This subsection specifies the construction.
+
+**Setup-source seed.** The setup consumes a single 32-byte seed extracted from the genesis-state commitment (subsection 11.2.8). This seed is genesis-fixed and immutable; every node derives the same parameters from the same seed.
+
+**Discriminant derivation.** Given seed `s ∈ {0, 1}^256` and target bit-length `k` (where `k ≥ 2048` per subsection 3.8.2 for ≥128-bit classical security), the discriminant `D` is derived as:
+
+```
+1.  raw ← tagged_shake_256(CLASS_GROUP_DISCRIMINANT, BCS(s, k), k/8 bytes)
+2.  d   ← the non-negative integer represented by `raw` in big-endian
+3.  Set the high bit of `d` (bit position k − 1):
+    d ← d | (1 << (k − 1))
+4.  Clear the low two bits of `d`, then set both:
+    d ← (d & ¬3) | 3     # ensures d ≡ 3 (mod 4), hence D = −d ≡ 1 (mod 4)
+5.  D ← −d                # discriminant of imaginary quadratic order
+```
+
+Step 3 fixes the bit-width: the resulting `|D|` always has exactly `k` bits. Step 4 ensures `d ≡ 3 (mod 4)` so that `D = −d ≡ 1 (mod 4)`, which is required for `D` to be a valid discriminant of an integral binary quadratic form (subsection 3.8.1; the alternative `D ≡ 0 (mod 4)` is excluded here so the construction is single-residue-class and the algorithm above is deterministic-and-total). Step 5 produces the negative discriminant the class group is defined over.
+
+**Domain tag.** The construction uses a new BIP-340 tagged-hash domain tag `CLASS_GROUP_DISCRIMINANT = b"ADAMANT-v1-class-group-discriminant"` (subsection 3.3.1). This tag is consensus-binding: changing it after genesis would shift the entire class group to a different one, breaking every existing time-lock envelope. Per subsection 3.3.1, adding or renaming a domain tag is a hard fork.
+
+**Fundamental-discriminant calibration.** A discriminant `D` is **fundamental** when the imaginary quadratic order it defines is the maximal order of `ℚ(√D)`. Fundamental discriminants are the canonical inputs to the unknown-order assumption underlying the Wesolowski VDF; non-fundamental discriminants give class groups that are still useful but offer no security advantage and have a marginally different structure. The construction above does NOT enforce fundamentality: doing so would require primality / square-freeness tests over `k`-bit candidates that are themselves a substantial computational sub-arc. Empirical analysis on the deterministic seed prior to genesis confirms `D` is fundamental for the genesis-fixed seed before activation; if the analysis surfaces a non-fundamental result, the seed is rejected and the genesis state is rotated (genesis state itself is constitutional per subsection 11.2.8, so the rotation happens before publication, never after). This calibration is a pre-mainnet workstream item recorded in CLAUDE.md Section 10.
+
+**Hash-to-element procedure (pending sub-arc).** Sampling a uniformly-random class-group element from a byte string is required for time-lock envelope encryption (subsection 3.8.1 "Encryption"): the user's puzzle `g` is itself a hash-to-element output. The procedure follows the standard approach: deterministically iterate over candidate leading coefficients `a` (small primes), find `b` such that `b² ≡ D (mod 4a)` via Tonelli-Shanks modular square root, compute `c = (b² − D) / (4a)`, and return the reduced form. The full algorithm is specified at the implementation sub-arc when the modular-square-root infrastructure lands.
+
 ## 3.9 Zero-knowledge proofs
 
 The protocol's privacy layer (section 7) and recursive verification (section 8) use zero-knowledge succinct non-interactive arguments of knowledge (zk-SNARKs). Two specific systems are used: **Halo 2** for general-purpose proving with no trusted setup, and **KZG commitments** as a building block for vector commitments and for state commitments inside the consensus layer.
@@ -790,8 +821,7 @@ For clarity, the following are deliberately not specified in this section and ar
 - The recursive proof structure attesting to chain validity: deferred to section 8 (Consensus).
 - The genesis state, including the specific Powers of Tau parameters: deferred to section 11 (Genesis & Constitution).
 
-This section establishes the primitives. Subsequent sections specify how they are composed.
-# 4. Identity & Accounts
+This section establishes the primitives. Subsequent sections specify how they are composed.# 4. Identity & Accounts
 
 This section specifies how identity is represented on Adamant: how accounts are constructed, how keys authorise transactions, how users delegate visibility through view keys, and how recovery from key loss is handled. The design follows directly from the principles in section 2: privacy by default (II), permissionless participation (VII), and the cryptographic primitives in section 3.
 
@@ -995,8 +1025,7 @@ Reference wallets `SHOULD` make this configuration achievable in approximately t
 
 This section briefly anticipates section 10 (Economics & Incentives). Account-related operations — creation, key rotation, validation logic invocation — are subject to the protocol's fee mechanism. The fee for account creation is paid by the creator. Validation logic invocation (which occurs for every transaction the account submits) is paid by whichever party the validation logic specifies as fee-payer; this enables sponsored transactions, where an application or paymaster pays fees on behalf of the user.
 
-Section 10 specifies fee structure in detail. The note here is that the smart-account model permits fee abstraction natively: the question of "who pays" is part of the validation logic, not a separate concept.
-# 5. Object Model & State
+Section 10 specifies fee structure in detail. The note here is that the smart-account model permits fee abstraction natively: the question of "who pays" is part of the validation logic, not a separate concept.# 5. Object Model & State
 
 This section specifies how Adamant represents data on the chain. It is the longest technical section in the whitepaper because the object model touches every other component: it determines what transactions can do, what the virtual machine operates on, what the consensus mechanism orders, what the privacy layer shields, and what the recursive verification proves.
 
@@ -1382,8 +1411,7 @@ A transfer transaction reads the sender's balance object, the recipient's balanc
 
 This pattern — global supply object plus per-holder balance objects — is the canonical fungible-token implementation on Adamant. It supports parallel processing (transfers between disjoint pairs of accounts do not conflict), it supports privacy (balances are shielded; transfers use stealth addresses; observers see only that *some* account transferred to *some other* account), and it is verifiable by recursive proofs (the chain's recursive proof attests that all balance changes are well-formed across all token types).
 
-Section 6 (the virtual machine) specifies how this pattern is expressed in the protocol's smart-contract language. Section 7 specifies the privacy mechanisms that shield the contents.
-# 6. Execution & Virtual Machine
+Section 6 (the virtual machine) specifies how this pattern is expressed in the protocol's smart-contract language. Section 7 specifies the privacy mechanisms that shield the contents.# 6. Execution & Virtual Machine
 
 This section specifies how transactions are executed on Adamant: the smart-contract language, the virtual machine, the parallel execution model, and the resource accounting (gas) framework. It builds directly on the object model of section 5 and is the layer at which user-defined logic interacts with chain state.
 
@@ -1949,6 +1977,48 @@ A module is valid for deployment if and only if all five steps succeed. The orde
 
 **Implementation note.** The Adamant-native deserializer, serializer, type definitions, helpers, and verifier passes are protocol-level concerns: a conforming implementation must reach the same accept/reject decision on every module-bytes input as the spec's pipeline, and the production-build dependency posture is fixed (no vendored Sui-Move crates in the production dependency graph; test-only, build-tooling-only, and CI-only dependencies are explicitly permitted). Internal representations, data-structure choices, and pass-orchestration details are implementation-discretionary, but both the externally observable accept/reject behaviour and the production-dependency posture are fixed. Two implementations that disagree on whether a given module-bytes input is valid for deployment are not both conforming, regardless of internal choices. The vendored Sui-Move crates are a cross-validation reference for the inherited subset and are exercised at test time; they are not part of the protocol-level specification and cannot appear in conforming production builds.
 
+#### 6.2.1.9 Arithmetic semantics
+
+The bytecode instructions enumerated in §6.2.1.4 include arithmetic, comparison, shift, and cast operations whose runtime semantics are part of the consensus-binding inherited-Sui-Move subset. The verifier (§6.2.1.6) statically rules out type mismatches at deploy time; the AVM runtime executes the well-typed instructions with the semantics specified in this subsection. These semantics are genesis-fixed in the same sense as the per-instruction gas costs (§6.2.1.7) and the deserialize+verify pipeline (§6.2.1.8).
+
+**Overflow handling.** `Add`, `Sub`, and `Mul` abort when the result of the operation would fall outside the operand type's unsigned integer range. The check applies uniformly to all six integer widths (`u8`, `u16`, `u32`, `u64`, `u128`, `u256`); no implicit wrapping or saturation occurs. The abort surfaces as a runtime arithmetic error. The transaction fails with state revert per §6.2.2 step 7 ("if execution failed, all state changes are discarded"), with gas charged for consumption up to the point of failure per §6.3.3.
+
+This matches the Move ecosystem's standard checked-arithmetic posture and preserves §6.2.4's determinism requirement: abort-on-overflow is deterministic across validators.
+
+**Division and modulo by zero.** `Div` and `Mod` abort when the right-hand operand (the divisor) is zero. The abort applies uniformly to all six integer widths. The abort surfaces as a runtime arithmetic error.
+
+**Shift amount bounds.** `Shl` and `Shr` consume the right-hand operand as a `u8` shift amount per the Move ecosystem convention. For operand types `u8`, `u16`, `u32`, `u64`, and `u128`, the runtime aborts when the shift amount is greater than or equal to the operand's bit width; the abort surfaces as a runtime arithmetic error. For operand type `u256`, no abort condition applies: the shift amount is necessarily less than 256 (the operand's bit width) because the shift amount is parsed as a `u8`, so the bounds check is structurally unreachable. The shift result for `u256` is well-defined for every `u8` shift amount in `[0, 255]`, computed as the unsigned-integer shift `lhs << rhs` (or `lhs >> rhs`) modulo `2^256`.
+
+These shift semantics align with Sui-Move's runtime semantics for the inherited subset; alignment preserves the strict-superset commitment of §6.2.1.1 — a pure-Sui module that exhibits abort-on-shift-too-large on Sui exhibits the same behaviour on Adamant.
+
+**Cast semantics.** `CastU8`, `CastU16`, `CastU32`, `CastU64`, `CastU128`, and `CastU256` convert the top-of-stack value to the destination type named in the opcode. The deploy-time type-safety pass admits any integer source type for any integer destination type; the runtime distinguishes three cases by the destination type's representable range relative to the source value:
+
+- *Same-type cast* (destination type equal to source type). The conversion always succeeds; the result is the source value unchanged.
+- *Widening cast* (destination bit width strictly greater than source bit width). The conversion always succeeds; the source value is representable in the destination type by zero-extension.
+- *Narrowing cast* (destination bit width less than source bit width). The conversion succeeds when the source value lies within the destination type's representable range; otherwise the runtime aborts with a runtime arithmetic error.
+
+Silent truncation is not protocol behaviour: financial code routinely depends on cast-to-narrower being either lossless or loud, and Adamant aligns with Move ecosystem precedent in choosing loud (abort-on-out-of-range) over silent.
+
+**Comparison ordering.** `Lt`, `Gt`, `Le`, and `Ge` interpret integer operands as unsigned. Adamant Move's integer types are all unsigned: there are no signed integer primitives, in keeping with Move's inherited type system. The comparison is well-defined for any pair of operands of the same integer type — `Lt(a, b)` returns `true` if and only if the unsigned-integer interpretation of `a` is strictly less than the unsigned-integer interpretation of `b`.
+
+Adding signed integer types is a hard fork; the unsigned interpretation of these comparison instructions is genesis-fixed.
+
+**Cross-type comparison: verifier residual binding.** The deploy-time type-safety pass (§6.2.1.6 inherited check) ensures that `Lt`, `Gt`, `Le`, `Ge`, `Eq`, and `Neq` dispatch only on operand pairs of matching types, and that `Eq` / `Neq` operate only on values whose types carry the appropriate ability. The runtime carries a residual binding for the case where the verifier failed to catch the mismatch: if a comparison reaches the runtime with operands of different types, the AVM aborts the transaction with an invariant-violation error. This case fires only if the verifier was unsound for the inherited subset or if the bytecode was modified after deployment outside the upgrade-compatibility surface (§6.4.3); same posture as the residual binding for Rule 7 privacy consistency in §6.2.1.6.
+
+**Equality semantics.** `Eq` and `Neq` pop two values from the operand stack and compare them at the runtime representation level. `Eq` returns `true` when the two values are byte-identical in their runtime representation; `Neq` returns `true` when they differ.
+
+For primitive types (`u8` through `u256`, `bool`, `address`), byte-identity is equivalent to value equality at the unsigned-integer / boolean / address-byte interpretation. For struct values, byte-identity is computed field-wise and recurses into nested structs: two struct values are equal if and only if their `type_id` matches and every corresponding field is equal under this same definition. For vectors, byte-identity is computed element-wise: two vectors are equal if and only if they have the same length and every corresponding element is equal.
+
+*Shielded values.* A shielded value (§7) is represented at the runtime layer by its ciphertext form. `Eq` and `Neq` on shielded values compare the ciphertext bytes, not the underlying plaintexts. The relationship between ciphertext equality and plaintext equality is determined by §7's encryption scheme for the specific shielded-value category: under probabilistic encryption schemes (such as the Poseidon commitment scheme with per-note randomness used for §7.1.1 notes, or the ChaCha20-Poly1305 AEAD with per-memo nonce used for §7.6.1 encrypted memos), ciphertext equality does not imply plaintext equality and `Eq` does not leak plaintext information through its result; under any deterministic encryption scheme that §7 may admit, ciphertext equality would imply plaintext equality, and `Eq` would correspondingly reveal that property to observers. Plaintext equality on shielded values is a privacy-layer primitive: contract authors who require plaintext-equality semantics on shielded operands must invoke a privacy-circuit instruction (`GenerateProof` or `VerifyProof` per §6.2.1.4) with a circuit whose witness encodes plaintext equality, expressed in the contract's circuit definition (§7) rather than in raw bytecode.
+
+The verifier (§6.2.1.6) does not statically diagnose bytecode-level `Eq` on shielded values as potential plaintext-equality misuse; this responsibility rests with the contract author and with compiler / IDE tooling at the source-language layer rather than at the protocol layer. The runtime executes `Eq` on shielded values with the ciphertext-byte-comparison semantics specified above regardless of whether the result corresponds to plaintext equality in the contract author's intended sense.
+
+This separation preserves the privacy guarantee at the cryptographic boundary specified by §7: a shielded value's plaintext is revealed only at privacy-circuit dispatch points. Bytecode-level equality testing on shielded values does not constitute that boundary; whether ciphertext equality leaks plaintext equality at the observer level is a property of §7's encryption scheme rather than of the AVM's `Eq` semantics.
+
+**Wrapping arithmetic and the bytecode enum.** The bytecode enum specified in §6.2.1.4 contains no wrapping-arithmetic opcodes — no `WrappingAdd`, `WrappingShl`, or analogues. Adding wrapping-arithmetic opcodes is a hard fork per §6.2.1.4's "the complete instruction set — inherited and extension — is genesis-fixed" framing. The current set ships the checked semantics (abort-on-overflow / abort-on-zero / abort-on-shift-too-large) specified above.
+
+**Genesis-fixed posture.** These semantics are part of the inherited Sui-Move runtime that is consensus-binding from genesis per §6.2.1.6 ("a module that is accepted is guaranteed by the consensus layer to have the validated properties"). Two implementations of Adamant that disagree on the runtime semantics of any inherited arithmetic, comparison, shift, or cast instruction are not both conforming, regardless of internal structure. Implementations may, of course, optimise the implementation of these semantics (e.g., compiler intrinsics, SIMD lanes, batch evaluation) so long as the externally observable accept/reject decision and stack-effect for any well-typed inputs match this specification.
+
 ### 6.2.2 Execution model
 
 When a transaction is executed by the AVM, the following sequence occurs:
@@ -2058,7 +2128,17 @@ Smart contracts on Adamant are organised into *modules*, the same unit of code o
 
 Module deployment is a transaction whose effect is to create a new `Module` object on the chain. The `Module` object's `mutability` field is the module's declared mutability (from the `#[mutability(...)]` annotation, section 6.1.2). The module's bytecode is stored in the `contents` field.
 
-After deployment, contracts and other modules can reference the deployed module by its `ObjectId`, invoke its public functions, and read its public types.
+The `Module` object's fields are constructed as follows:
+
+- **`id`** — derived per section 5.1.1 from the deploying transaction's `TxHash` and the deployment's index within the transaction (transactions may deploy multiple modules atomically; the index disambiguates).
+- **`type_id`** — the genesis-fixed `TypeId` for `adamant::module::Module`, computed per section 5.1.2 over the canonical type identifier `(adamant_address, "module", "Module")` where `adamant_address` is the protocol-reserved address `0x1` (section 5.1.2's address-keyed namespace; `0x1` is the genesis-fixed address of the `adamant::*` standard library, parallel to Sui-Move's `0x1`/`0x2` system-address convention adapted for Adamant).
+- **`owner`** — `Ownership::Address(deploying_account)` taken from the transaction's `authorising_account` field. Modules are owned by the account that deployed them; the owner's authority over the module is bounded by the module's declared mutability (section 6.1.2). Stdlib modules deployed at genesis carry `Ownership::Shared` since they are not owned by any account.
+- **`mutability`** — the module's declared mutability, BCS-decoded from the `b"adamant.mutability"` metadata entry per section 6.2.1.3 and validated by validator Rule 1 (section 6.2.1.6).
+- **`lifecycle`** — `Active`. Modules use the standard object lifecycle (section 5.1.7); `Frozen` arises only via explicit `adamant::module::freeze` for `UpgradeableUntilFrozen` modules; `Archived` and `Destroyed` are the standard object-lifecycle states.
+- **`contents`** — the canonical Adamant Move bytecode of the module, byte-identical to the bytes that were validated by the deploy-time bytecode validator (section 6.2.1.6). Re-serialization of the validated `CompiledModule` and byte-comparison against the input is part of the validator's canonicality round-trip; the same bytes flow into `contents`.
+- **`metadata`** — the standard `ObjectMetadata` per section 5.1.6, with `creator` set to the deploying account and `proof_commitment` derived per the module-deployment commitment construction (deferred to section 7 for shielded deployments; transparent deployments commit to the bytecode hash).
+
+After deployment, contracts and other modules can reference the deployed module by its `ObjectId`, invoke its public functions, and read its public types. The `(deploying_address, module_name)` pair is also globally unique per the Move module-namespacing rule (section 6.2.1.3); the validator's `duplication_checker` pass rejects deployments that would create a name collision under the same deploying address.
 
 ### 6.4.2 Upgrade
 
@@ -2087,7 +2167,9 @@ For cases where breaking changes are desired, the standard pattern is to deploy 
 The protocol provides a standard library of modules, deployed at genesis with `Immutable` mutability. The standard library includes:
 
 - `adamant::primitives` — basic types (vectors, options, strings, etc.) and operations
-- `adamant::object` — object manipulation primitives
+- `adamant::module` — module deployment, upgrade, and freeze primitives invoked by the transaction format per section 6.0.2 line 97 (`adamant::module::deploy`) and section 6.4.2 (upgrade and freeze)
+- `adamant::tx_context` — transaction-context accessors (sender address, transaction hash, gas budget remaining) made available to executing bytecode by the runtime per section 6.2.2
+- `adamant::object` — object manipulation primitives (transfer, freeze, share, archive, restore)
 - `adamant::address` — address arithmetic and validation
 - `adamant::hash` — SHA-3 and BLAKE3 wrappers
 - `adamant::signature` — Ed25519 and ML-DSA verification
@@ -2098,6 +2180,10 @@ The protocol provides a standard library of modules, deployed at genesis with `I
 - `adamant::recovery` — social-recovery helpers for accounts
 
 Modules in the standard library are accessible from any contract without separate deployment. They are `Immutable` and cannot be modified post-genesis. A future hard fork may extend the standard library; existing standard-library modules are permanent.
+
+The `adamant::module`, `adamant::tx_context`, `adamant::object`, `adamant::hash`, `adamant::signature`, `adamant::privacy`, and `adamant::address` modules expose protocol-level operations that require runtime-side execution beyond what ordinary Adamant Move bytecode can express (chain-state mutation, cryptographic primitives, view-key release, primitive-type ↔ byte-vector conversion, etc.). Function calls to these modules' functions are dispatched by the runtime to native Rust handlers per the AVM's execution model (section 6.2.2). The dispatch is byte-identical from the caller's perspective to a normal `Call` instruction; the difference is internal to the runtime and consensus-binding via the genesis-fixed mapping from `(module_id, function_id)` to native handler. Adding or removing a native-dispatched stdlib function is a hard fork.
+
+Within `adamant::address`, the `to_bytes` and `from_bytes` functions are runtime-dispatched because Move's `address` primitive type cannot be converted to `vector<u8>` in pure bytecode. The `equals` function is also runtime-dispatched for symmetry with the rest of the address helper set, even though Move's built-in `==` operator could express the same check; consolidating the address API at one dispatch tier simplifies the gas-table treatment per section 6.2.1.7.
 
 The standard library is deliberately conservative. It provides the primitives applications need without prescribing application architectures. Higher-level patterns (decentralised exchange logic, lending protocols, identity systems, etc.) are expected to be implemented as user-deployed modules, not bundled into the standard library.
 
@@ -2178,6 +2264,26 @@ The section builds on section 3 (cryptographic primitives), section 4 (account m
 8. Compliance considerations and threat boundaries
 
 The design follows from Principle II (privacy by default), and it is designed to interact cleanly with Principle I (credible neutrality) and Principle IV (performance). Where these come into tension, the priority order in section 2.8 governs.
+
+## 7.0 Encryption posture
+
+All shielded encryption in this section uses **probabilistic** schemes. Two encryptions of the same plaintext under the same key produce different ciphertexts; ciphertext equality does not imply plaintext equality. This is a protocol-level commitment, not a per-site convention.
+
+The commitment matters because the runtime's shielded-value-equality semantics (§6.2.1.9) compares ciphertext bytes verbatim — `Bytecode::Eq` on two shielded values returns `true` when the ciphertext bytes match, `false` otherwise. The privacy property — *ciphertext equality reveals nothing about plaintext equality* — depends on the encryption being probabilistic. A deterministic shielded-encryption scheme would silently break this property: two equal plaintexts would produce equal ciphertexts, and an observer could detect plaintext equality by ciphertext comparison without holding the key.
+
+The §7.0 posture binds every on-chain shielded-encryption surface in this section. The surfaces and their per-site specification status as of this amendment:
+
+- **Note commitments** (§7.1) — Poseidon hash with per-note `randomness: [u8; 32]`. Scheme fully specified by §7.1; probabilistic by construction (the per-note randomness ensures uncorrelated commitments for byte-equal `(value, asset_type, recipient, metadata)` tuples).
+- **Stealth-address ciphertexts** (§7.2.2) — ML-KEM-768 encapsulation per FIPS 203. Scheme fully specified by §7.2.2; probabilistic by FIPS 203 §6.3 (a fresh `m ← {0,1}^256` is sampled per encapsulation call).
+- **Encrypted memos** (§7.6.1) — ChaCha20-Poly1305 with `memo_key = HashToKey(s || domain_tag_memo)`. Scheme partially specified by §7.6.1; the nonce-derivation half is not pinned at this amendment and remains open per the §3.5 framing ("Implementation details for nonce derivation are specified per-use in subsequent sections"). The §7.0 posture binds the eventual specification to a probabilistic shape.
+- **Encrypted note delivery** (§7.3.1 `encrypted_outputs: Vec<EncryptedNote>`) — encryption scheme not specified at this amendment. The §7.0 posture binds the eventual specification to a probabilistic shape.
+- **Shielded object contents** (§7.8.1) — encryption scheme not specified at this amendment. The §7.0 posture binds the eventual specification to a probabilistic shape.
+
+Per-site specifications for the three open surfaces (memo nonce derivation, encrypted-note delivery, shielded object contents) are subsequent §7 substantive work. The §7.0 posture pre-binds them: any scheme that lands at those subsections must be probabilistic. An implementation that proceeds with an as-yet-unspecified surface — for example, by choosing a default scheme for shielded object contents — must choose a probabilistic scheme to be conformant.
+
+**Surfaces the posture does not bind.** Out-of-protocol encryption — for example, witness encryption between a user and a prover in the prover market (§7.7.1) — is operationally distinct from on-chain shielded encryption. The §6.2.1.9 shielded-value-equality runtime semantics applies only to on-chain ciphertext bytes; out-of-protocol encryption is the user's choice and does not affect consensus.
+
+**Anti-pattern (explicitly forbidden).** Deterministic encryption schemes — for example, AES-ECB, AES-SIV with deterministic IV, or Poseidon-as-encryption without per-input randomness — are not admitted for any on-chain shielded-encryption surface. An implementation that substitutes a deterministic scheme is non-conforming, regardless of whether the scheme is otherwise cryptographically strong: the conformance break is at the privacy-property level, not the cryptographic-strength level.
 
 ## 7.1 The note model
 
@@ -2270,19 +2376,19 @@ The protocol uses an **ML-KEM-based stealth address scheme**, providing post-qua
 
 A recipient's long-term identity comprises:
 
-- **Spending key** `sk_s`: scalar in the BLS12-381 scalar field (used for nullifier derivation and spending authorization, classical layer; see section 7.2.5 for hybrid-mode considerations)
+- **Spending key** `sk_s`: scalar in the **Pallas scalar field** (used for nullifier derivation and spending-address authorization; see section 7.2.5 for hybrid-mode signature considerations, which are independent of the stealth-address arithmetic)
 - **Viewing keypair** `(sk_v_kem, pk_v_kem)`: an ML-KEM-768 keypair (public key 1184 bytes, secret key 2400 bytes)
-- **Spending public key** `pk_s = sk_s · G` where G is the BLS12-381 curve generator
+- **Spending public key** `pk_s = sk_s · G` where G is the **Pallas curve generator**
 
-The recipient's "address" published off-chain (in payment URIs, QR codes, etc.) is `(pk_s, pk_v_kem)`. ML-KEM public keys are larger than ECDH public keys, so addresses are larger; address-encoding formats accommodate this (Bech32m at appropriate length, QR codes scaled correspondingly).
+The recipient's "address" published off-chain (in payment URIs, QR codes, etc.) is `(pk_s, pk_v_kem)`. `pk_s` is a Pallas point encoded as its 32-byte canonical compressed form (x-coordinate plus sign bit). ML-KEM public keys are larger than ECDH public keys, so the combined address is dominated by `pk_v_kem` (1184 bytes); address-encoding formats accommodate this (Bech32m at appropriate length, QR codes scaled correspondingly).
 
 To send a note to this recipient, a sender:
 
 1. Performs ML-KEM-768 encapsulation against `pk_v_kem`, producing `(ct, ss)` where `ct` is a 1088-byte ciphertext and `ss` is a 32-byte shared secret
 2. Stores `ct` as part of the note's on-chain data (analogous to the `R` element in classical schemes)
-3. Computes the shared scalar: `s = HashToScalar(ss || domain_tag)` where `HashToScalar` produces a BLS12-381 scalar field element
-4. Computes the one-time stealth address: `P = pk_s + s · G`
-5. Constructs the note with `recipient = P`
+3. Computes the shared scalar: `s = HashToScalar(ss || domain_tag)` where `HashToScalar` produces a **Pallas scalar field element**
+4. Computes the one-time stealth address: `P = pk_s + s · G` (a Pallas point)
+5. Constructs the note with `recipient = P`, where `recipient` is the canonical 32-byte encoding of `P`'s base-field x-coordinate (the same Pallas-base-field element width as the rest of the note-commitment inputs per section 7.1)
 
 The recipient's wallet, upon scanning the chain, performs for each note:
 
@@ -2293,7 +2399,9 @@ The recipient's wallet, upon scanning the chain, performs for each note:
 
 If the note is theirs, the recipient derives the corresponding spending key as `sk' = sk_s + s'` and uses it to construct the nullifier when spending.
 
-**Why ML-KEM and not BLS12-381 ECDH.** ECDH on BLS12-381 (or any elliptic curve over a finite field) is broken by Shor's algorithm; a future quantum adversary observing historical chain state can recover `r · pk_v` from `(r · G, pk_v)` by computing the discrete logarithm. ML-KEM is lattice-based and presumed post-quantum-secure; encapsulation outputs cannot be retroactively broken by quantum attack. The cost of this protection is the per-note ciphertext size (1088 bytes vs ~32 bytes for ECDH); this is amortised across the note's lifetime and is acceptable given the permanence of the privacy guarantee.
+**Why ML-KEM and not curve ECDH.** ECDH on any elliptic curve over a finite field is broken by Shor's algorithm; a future quantum adversary observing historical chain state can recover `r · pk_v` from `(r · G, pk_v)` by computing the discrete logarithm. ML-KEM is lattice-based and presumed post-quantum-secure; encapsulation outputs cannot be retroactively broken by quantum attack. The cost of this protection is the per-note ciphertext size (1088 bytes vs ~32 bytes for ECDH); this is amortised across the note's lifetime and is acceptable given the permanence of the privacy guarantee.
+
+**Cross-curve note.** The stealth-address arithmetic above operates on the **Pasta cycle** (Pallas/Vesta), matching Halo 2's native field per section 3.9.1 and Poseidon's field of definition per section 3.3.3. This is intentional: stealth addresses appear as the `recipient` field inside note commitments (section 7.1), which are hashed in-circuit by Poseidon; placing the address arithmetic on Pallas keeps the in-circuit verification native and avoids non-native arithmetic emulation. The protocol's *other* curve, BLS12-381, is used independently for KZG vector commitments (section 3.9.2), threshold encryption (section 3.6), and validator BLS signatures (section 3.4.3); BLS12-381 does not appear in stealth-address derivation. Pre-amendment drafts of section 7.2.2 specified BLS12-381 for the stealth-address arithmetic; that conflicted with section 3.3.3's amended Poseidon field-of-definition (Pallas) and section 7.1's commitment formula. The amendment unifies the privacy-layer arithmetic on Pasta cycle native fields, parallel to the section 3.3.3 amendment instance 31.
 
 **Bytecode-level construction.** Section 6.2.1.4's `MlKemEncapsulate` and `MlKemDecapsulate` instructions perform the ML-KEM operations inside Adamant Move shielded circuits. The compiler emits these instructions automatically when `#[shielded]` functions construct or process notes; contract authors do not invoke them directly.
 
@@ -2328,16 +2436,70 @@ A shielded transaction comprises:
 
 ```
 ShieldedTransaction {
-    nullifiers:        Vec<Nullifier>,        // notes being spent
-    output_commitments: Vec<NoteCommitment>,  // notes being created
-    encrypted_outputs:  Vec<EncryptedNote>,   // for recipient delivery
-    public_inputs:     PublicInputs,          // explicit transaction parameters
-    proof:             Halo2Proof,            // attests to validity
-    binding_signature: Signature,             // ties the proof to the transaction
+    nullifiers:               Vec<Nullifier>,         // notes being spent
+    input_value_commitments:  Vec<ValueCommitment>,   // hiding commitments for input values (one per nullifier, same order)
+    output_commitments:       Vec<NoteCommitment>,    // notes being created
+    output_value_commitments: Vec<ValueCommitment>,   // hiding commitments for output values (one per output_commitment, same order)
+    encrypted_outputs:        Vec<EncryptedNote>,     // for recipient delivery
+    public_inputs:            PublicInputs,           // explicit transaction parameters
+    proof:                    Halo2Proof,             // attests to validity
+    binding_signature:        Signature,              // ties the proof to the transaction
 }
 ```
 
-Public inputs include the nullifiers, the output commitments, the GNCT root being spent against, the asset types involved (which may be partially disclosed for compliance), and any explicit fees. Everything else is hidden.
+Public inputs include the nullifiers, the output commitments, the input and output value commitments, the GNCT root being spent against, the asset types involved (which may be partially disclosed for compliance), and any explicit fees. Everything else is hidden.
+
+The `input_value_commitments` array is parallel to `nullifiers` (index `i` of one corresponds to index `i` of the other); the `output_value_commitments` array is parallel to `output_commitments`. The two sequences let validators perform the homomorphic balance check at consensus time without learning the underlying values; see §7.3.1.2 for the construction and §7.3.2 statement 4 for the balance constraint.
+
+#### 7.3.1.1 EncryptedNote construction
+
+An `EncryptedNote` is the on-chain ciphertext that allows the recipient to decrypt the note's contents upon scanning the chain. The construction:
+
+```
+EncryptedNote {
+    ml_kem_ciphertext: [u8; 1088],  // ML-KEM encapsulation
+    chacha_ciphertext: Vec<u8>,     // encrypted note payload
+    auth_tag:          [u8; 16],    // Poly1305 authentication tag
+}
+```
+
+A sender constructs an `EncryptedNote` as:
+
+1. ML-KEM-768 encapsulation against recipient's `pk_v_kem` per §7.2.2: `(ml_kem_ciphertext, ss) = ML-KEM-768.Encap(pk_v_kem)`
+2. Derive symmetric key: `note_key = HKDF-SHA3(salt = domain_tag_note_key, ikm = ss, info = note_position_bytes, L = 32)` where `domain_tag_note_key = b"ADAMANT-v1-note-key"` and `note_position_bytes` is the 8-byte little-endian note position in the global note commitment tree
+3. Derive nonce: `note_nonce = SHA3_256(ss || domain_tag_note_nonce)[0..12]` where `domain_tag_note_nonce = b"ADAMANT-v1-note-nonce"`
+4. Encrypt note payload (BCS-encoded note tuple per §7.1): `(chacha_ciphertext, auth_tag) = ChaCha20Poly1305-Encrypt(note_key, note_nonce, note_payload)`
+
+The recipient decrypts by ML-KEM decapsulation against `sk_v_kem`, derives the same `note_key` + `note_nonce` from the recovered shared secret, and applies `ChaCha20Poly1305-Decrypt`.
+
+**Probabilistic property satisfied per §7.0.** Per-note ML-KEM encapsulation produces a fresh `ss` per FIPS 203 §6.3 (randomized encapsulation); the derived `note_key` + `note_nonce` are per-note unique; ciphertexts are uncorrelated across notes even for byte-equal note payloads.
+
+#### 7.3.1.2 Value commitments
+
+A `ValueCommitment` is a 32-byte Pedersen-style commitment on the Pallas curve that hides a note's value while remaining additively homomorphic, so the chain can verify per-asset-type value conservation (§7.3.2 statement 4) without learning any individual value.
+
+**Construction.** For a note with value `v: u64`, asset type `τ: TypeId`, and per-commitment randomness `r ∈ Pallas scalar field`:
+
+```
+vc = v · V_τ + r · R   (a Pallas point)
+```
+
+where:
+
+- `V_τ` is the asset-specific value generator: `V_τ = HashToCurve("ADAMANT-v1-vc-base", τ_bytes)` — a Pallas point derived deterministically from the 32-byte canonical encoding of the asset type via the `pasta_curves` `Point::hash_to_curve` construction (Simplified SWU map per IRTF `draft-irtf-cfrg-hash-to-curve`).
+- `R` is the universal randomness generator: a single fixed Pallas point derived once via `R = HashToCurve("ADAMANT-v1-vc-randomness", b"")`. `R` is independent of every `V_τ` (different domain tag); the discrete log of `R` with respect to any `V_τ` is unknown to all parties (genuinely random Pallas point).
+- The on-chain encoding of `vc` is the 32-byte canonical compressed Pallas point form (x-coordinate plus 1-bit y-sign per pasta_curves' `GroupEncoding`), matching the `recipient` stealth-address encoding in §7.2.2.
+
+**Properties.**
+
+- **Hiding.** The `r · R` term blinds the value; without knowing `r`, an observer cannot recover `v` (computational hiding under the discrete-log assumption on Pallas).
+- **Asset-type hiding.** The randomness blinding extends to the asset-specific component: an observer cannot determine `τ` from `vc` alone (cannot distinguish `(v_1, τ_1, r_1)` from `(v_2, τ_2, r_2)` without solving multi-discrete-log).
+- **Binding.** Given `vc`, the opening `(v, τ, r)` is computationally unique under the discrete-log assumption (a different opening would reveal a discrete-log relation between `V_τ` and `R`).
+- **Additively homomorphic.** `vc(v_1, τ, r_1) + vc(v_2, τ, r_2) = vc(v_1 + v_2, τ, r_1 + r_2)` (point addition on Pallas, per-asset-type group). Cross-asset addition does NOT preserve commitment shape (the `V_{τ_1}` and `V_{τ_2}` generators are independent), which is exactly what makes the per-asset-type balance check work.
+
+**Per-input vs per-output randomness.** Each input note's `vc_in` carries a randomness `r_in_i` known to the spender; each output note's `vc_out` carries a randomness `r_out_j` known to the sender. The §7.3.2 statement 4 balance equation requires the randomness sums to cancel: `Σ r_in - Σ r_out = r_balance`, where `r_balance` is committed to by the [`binding_signature`] (§7.3.1) — the binding signature is over a transcript that includes `Σ vc_in - Σ vc_out` and is signed under the key `r_balance · R`. This is the standard Sapling-style binding-signature pattern (Hopwood / Bowe / Hornby / Wilcox 2020); a successful binding signature attests both that the spender chose a randomness assignment such that the per-asset-type values balance AND that the full transaction (proof + commitments) is bound to a single coherent randomness sum.
+
+**Construction of `R` and `V_τ`.** Genesis-fixed; the byte tags `b"ADAMANT-v1-vc-base"` and `b"ADAMANT-v1-vc-randomness"` are part of the consensus rules per §3.3.1 (changing them is a hard fork). Wallet implementations MUST derive `R` lazily once at startup and cache it; `V_τ` is derived per asset type the wallet handles.
 
 ### 7.3.2 The validity circuit
 
@@ -2350,6 +2512,14 @@ The Halo 2 circuit that proves validity asserts the following statements:
 3. **Output note well-formedness.** Each output commitment is correctly computed from valid inputs (a recipient stealth address, a value, an asset type, randomness).
 
 4. **Value conservation.** The sum of input values equals the sum of output values plus the explicit fees, *per asset type*. This is the property that prevents inflation: a shielded transaction cannot create value from nothing or destroy value silently.
+
+   Enforced via the homomorphic value commitments of §7.3.1.2. The validity circuit attests that each per-input and per-output value commitment is correctly constructed (the prover knows `(v, τ, r)` openings consistent with the corresponding note commitment). The chain-level balance check is then a single point equation evaluated on public data:
+
+   ```
+   Σ vc_in − Σ vc_out − Σ_τ (fee_τ · V_τ) = r_balance · R
+   ```
+
+   Validators verify this equation and the binding signature over the same transcript (§7.3.1.2). Both checks are public-data-only — no zero-knowledge proof is needed for the balance equation itself; the proof is needed only for the per-commitment opening attestation. The balance check is per-asset-type implicitly: because `V_τ` is independent across asset types (§7.3.1.2 hash-to-curve construction), the balance equation can hold only if for every τ in the transaction, `Σ_in v_τ = Σ_out v_τ + fee_τ` (otherwise the `V_τ` term would not cancel).
 
 5. **Range proofs.** Every value in the transaction lies in `[0, 2^64)`. Without this, an attacker could create notes with negative values that nominally satisfy value conservation while creating value.
 
@@ -2395,17 +2565,36 @@ The viewing key has full visibility. Sub-view-keys are derived deterministically
 
 ### 7.4.2 Sub-view-key construction
 
-A sub-view-key for scope `S` is constructed as:
+A sub-view-key for scope `S` is a deterministically derived ML-KEM-768 keypair:
 
 ```
-sub_view_key_S = (sk_v + Hash(domain || S || sk_v) · G_aux)
+sub_seed_S = HKDF-SHA3(
+    salt = domain_tag_subview,
+    ikm  = sk_v_kem_seed,
+    info = BCS(S),
+    L    = 64
+)
+(sub_sk_v_kem_S, sub_pk_v_kem_S) = ML-KEM-768.KeyGen(sub_seed_S)
 ```
 
-Where `G_aux` is a fixed auxiliary curve point and `S` is a structured description of the sub-key's scope (e.g. `{"start": t1, "end": t2}` for a time-windowed key).
+where:
 
-The sub-view-key allows the holder to compute the shared secret `s'` for notes that fall within scope `S`, but is cryptographically constructed so that notes outside scope `S` produce nonsense decryption results.
+- `sk_v_kem_seed` is the 64-byte canonical seed of the parent viewing keypair `(sk_v_kem, pk_v_kem)` per §7.2.2
+- `domain_tag_subview = b"ADAMANT-v1-subview-derive"`
+- `S` is the structured scope descriptor (e.g. `{"start": t1, "end": t2}` for a time-windowed key); `BCS(S)` is its canonical encoding per §5.1.8
+- HKDF-SHA3 is the HKDF construction per RFC 5869 instantiated with SHA3-256, matching the HKDF usage for spending-key derivation per §7.2.5
+- L = 64 produces the 64-byte seed required for ML-KEM-768 deterministic key generation per FIPS 203 §6.1
+- ML-KEM-768.KeyGen is the FIPS 203 deterministic key-generation function
 
-The implementation of "in scope" is enforced by the recipient's wallet, not by the chain: the wallet decides which sub-view-keys to derive and to whom. The chain has no view-key-related logic; it does not know which sub-view-keys exist.
+Properties:
+
+- **One-way derivation.** A sub-view-key holder cannot derive the parent viewing-keypair seed. HKDF-SHA3 is cryptographically one-way; reversing the derivation requires breaking SHA3-256 preimage resistance.
+- **Scope-bound decapsulation.** The sub-view-key holder can decapsulate notes whose stealth-address derivation used the same ML-KEM public key family (i.e., notes within scope `S`). Notes outside scope `S` were encapsulated against the parent `pk_v_kem`, not `sub_pk_v_kem_S`; decapsulating them with the sub-view-key produces deterministic-but-meaningless results per FIPS 203 §6.4.1 implicit rejection.
+- **Determinism.** Same parent seed + same scope `S` always produces the same sub-view-key. No per-derivation entropy.
+
+The implementation of "in scope" — which sub-view-keys to derive and to whom — is enforced by the recipient's wallet, not by the chain. The chain has no sub-view-key awareness.
+
+**Bytecode-level construction.** Section 6.2.1.4's `ReleaseSubViewKey` instruction performs the HKDF-SHA3 derivation step; ML-KEM-768.KeyGen from the derived seed is performed by the wallet outside shielded execution (the runtime does not need to materialise the keypair; only the seed is exposed via `ReleaseSubViewKey`).
 
 ### 7.4.3 Provable disclosure
 
@@ -2477,6 +2666,16 @@ memo_key = HashToKey(s || domain_tag_memo)
 encrypted_memo = ChaCha20Poly1305(memo_key, nonce, memo_plaintext)
 ```
 
+The nonce is derived deterministically from the per-note shared secret to ensure non-reuse:
+
+```
+nonce = SHA3_256(s || domain_tag_memo_nonce)[0..12]
+```
+
+where `s` is the per-note ML-KEM shared secret per §7.2.2 and `domain_tag_memo_nonce = b"ADAMANT-v1-memo-nonce"`. The 12-byte truncation matches ChaCha20-Poly1305's 96-bit nonce width per §3.5.
+
+Nonce non-reuse follows from `s` being per-note (each note has fresh ML-KEM encapsulation per §7.2.2) and the domain tag preventing cross-protocol nonce collision. The construction satisfies the §7.0 encryption-posture probabilistic-only requirement: equal memo plaintexts under different notes encrypt under different `(memo_key, nonce)` pairs and produce uncorrelated ciphertexts.
+
 The recipient decrypts using their derived shared secret.
 
 ### 7.6.2 Memo policies
@@ -2519,7 +2718,22 @@ Section 5.7 anticipated this subsection: how does the privacy layer interact wit
 
 An object is either **shielded** or **transparent**, declared at creation:
 
-- **Shielded objects.** The `contents` field is encrypted. State transitions are accompanied by Halo 2 proofs attesting to correctness. The object's existence is public; its contents and ownership details are not.
+- **Shielded objects.** The `contents` field is encrypted using the following construction:
+
+```
+shielded_contents {
+    object_key_ciphertext: [u8; 1088],  // ML-KEM encapsulation
+    contents_ciphertext:   Vec<u8>,     // encrypted contents
+    auth_tag:              [u8; 16],    // Poly1305 tag
+    update_nonce:          [u8; 12],    // per-update nonce
+}
+```
+
+The `object_key_ciphertext` is an ML-KEM-768 encapsulation against the owner's viewing public key `pk_v_kem` per §7.2.2, performed at object creation or owner-rotation. The encapsulated shared secret `ss_obj` is the long-term object-level key material. Per-update encryption derives the symmetric key as `update_key = HKDF-SHA3(salt = domain_tag_object_update, ikm = ss_obj, info = object_id || version_u64_le, L = 32)` where `domain_tag_object_update = b"ADAMANT-v1-object-update"`. The `update_nonce` is sampled fresh per write (random 12-byte value); encryption is `(contents_ciphertext, auth_tag) = ChaCha20Poly1305-Encrypt(update_key, update_nonce, contents_payload)`.
+
+State transitions update `contents_ciphertext` + `update_nonce` together; `object_key_ciphertext` rotates only on owner change. State transitions are accompanied by Halo 2 proofs attesting to correctness. The object's existence is public; its contents and ownership details are not.
+
+The construction satisfies the §7.0 encryption-posture probabilistic-only requirement: per-update random nonce ensures equal `contents_payload` across updates produces uncorrelated ciphertexts.
 
 - **Transparent objects.** The `contents` field is in clear text. State transitions are visible to all observers. Ownership is visible. Useful for public-record applications, public bounties, transparent governance, and any case where the application's purpose requires transparency.
 
@@ -2598,8 +2812,7 @@ The privacy layer is constructed from peer-reviewed primitives composed in well-
 - **Encrypted memos** using ML-KEM-768 for sender-to-recipient context, post-quantum-secure
 - **Prover markets** for optional outsourcing of proof generation
 
-The contribution is the integration: a system where these primitives compose cleanly with the object model, the smart-contract language, and the consensus mechanism (specified in section 8 next), to deliver a chain that is genuinely private by default, post-quantum-secure at the privacy-relevant key-agreement surfaces, and genuinely usable.
-# 8. Consensus
+The contribution is the integration: a system where these primitives compose cleanly with the object model, the smart-contract language, and the consensus mechanism (specified in section 8 next), to deliver a chain that is genuinely private by default, post-quantum-secure at the privacy-relevant key-agreement surfaces, and genuinely usable.# 8. Consensus
 
 This section specifies how Adamant's validators agree on the order of transactions, the state of the chain, and the validity of each state transition. It is the longest technical section in this whitepaper because consensus is where the protocol's correctness, performance, and credible-neutrality properties are simultaneously realised.
 
